@@ -1,10 +1,15 @@
 import numpy as np
 import pandas as pd
 import os
+import cv2
+import matplotlib.pyplot as plt
 
 from models.ensemble import BaseLearners, StackingEnsemble
+from models.cnn_model import BrainTumorCNN
+from data.pipeline import DataIngestionPipeline, CNNFeatureExtractor
 from explainability.shap_explainer import SHAPExplainer
 from explainability.logic_rules import RuleBasedAssistant
+from explainability.lime_explainer import LIMEExplainer
 
 
 def find_sample_index(y_true, y_pred, target_true, target_pred):
@@ -17,131 +22,120 @@ def find_sample_index(y_true, y_pred, target_true, target_pred):
 
 def run_task4():
     print("=" * 50)
-    print("TASK 4: EXPLAINABILITY & REASONING LAYER")
+    print("TASK 4: EXPLAINABILITY & REASONING LAYER (SHAP + LIME + LOGIC)")
     print("=" * 50)
 
     # ---------------------------------------------------------
-    # 1. Load Data & Retrain Best Model (Stacking)
+    # 1. Load Data & Synchronize Splits
     # ---------------------------------------------------------
     try:
         X_best = np.load("saved_features/X_selected.npy")
         y = np.load("saved_features/y_labels.npy")
+        mask = np.load("saved_features/mask_selected.npy")
     except FileNotFoundError:
         print("Error: Could not find saved features. Please run run_task2.py first.")
         return
 
-    print("Retraining Stacking Ensemble on canonical features...")
+    # To run LIME, we need the raw images [250, 250, 3] for the validation set
+    print("Loading raw images for LIME synchronization...")
+    ingestion = DataIngestionPipeline(data_dir="data")
+    X_raw, _ = ingestion.load_data(subset="Training")
+
+    print("Retraining Stacking Ensemble and synchronizing splits...")
     learner_manager = BaseLearners()
+    # BaseLearners uses random_state=42 for its split
     learner_manager.train_base_learners(X_best, y)
+
+    # Split X_raw exactly like the tabular features were split
+    from sklearn.model_selection import train_test_split
+    _, X_raw_val, _, _ = train_test_split(
+        X_raw, y, test_size=0.2, random_state=42, stratify=y
+    )
 
     stacker = StackingEnsemble()
     stacker.fit(learner_manager.X_train, learner_manager.y_train)
     model = stacker.stacker
 
-    # Get predictions and probabilities for the validation set
+    # Get predictions for the validation set
     y_val_pred = model.predict(learner_manager.X_val)
     y_val_proba = model.predict_proba(learner_manager.X_val)[:, 1]
     y_val_true = learner_manager.y_val
 
     # ---------------------------------------------------------
-    # 2. Instantiate SHAP & Run Global Explanations
+    # 2. Initialize Explainers
     # ---------------------------------------------------------
-    print("\n--- Phase 1: SHAP Global Explainability ---")
+    # 1. CNN Extractor (for LIME)
+    cnn_model = BrainTumorCNN()
+    extractor = CNNFeatureExtractor(
+        model=cnn_model,
+        model_weights_path="best_model.pth",
+        target_layer_name="features"
+    )
+
+    # 2. SHAP
     shap_explainer = SHAPExplainer(model, learner_manager.X_train)
     shap_explainer.explain_global(learner_manager.X_val, save_dir="saved_features")
 
-    # Extract the integer indices of the top 8 features from SHAP
+    # 3. LIME
+    lime_explainer = LIMEExplainer(extractor, mask, model)
+
+    # 4. Logic
     top_features_df = shap_explainer.get_top_features(n=8)
-    top_feature_indices = [
-        int(feat.split("_")[-1]) for feat in top_features_df["Feature"]
-    ]
-    print("\nTop SHAP Feature Indices:", top_feature_indices)
-
-    # ---------------------------------------------------------
-    # 3. Instantiate Rule-Based Assistant & Extract Thresholds
-    # ---------------------------------------------------------
-    print("\n--- Phase 2: Symbolic Logic Integration ---")
+    top_feature_indices = [int(feat.split("_")[-1]) for feat in top_features_df["Feature"]]
     assistant = RuleBasedAssistant()
-    assistant.extract_thresholds(
-        learner_manager.X_train, learner_manager.y_train, top_feature_indices
-    )
+    assistant.extract_thresholds(learner_manager.X_train, learner_manager.y_train, top_feature_indices)
 
     # ---------------------------------------------------------
-    # 4. Pick 3 Test Samples (TP, TN, FN)
+    # 3. Local Evaluation & Report Generation
     # ---------------------------------------------------------
-    print("\n--- Phase 3: Local Explanations & Rule Evaluation ---")
-
-    tp_idx = find_sample_index(y_val_true, y_val_pred, 1, 1)  # True Positive
-    tn_idx = find_sample_index(y_val_true, y_val_pred, 0, 0)  # True Negative
-    fn_idx = find_sample_index(y_val_true, y_val_pred, 1, 0)  # False Negative
-
-    # Fallback if the model is so good it has 0 False Negatives
-    if fn_idx is None:
-        print(
-            "Wow! 100% Recall achieved. No False Negatives found. Using a False Positive instead."
-        )
-        fn_idx = find_sample_index(y_val_true, y_val_pred, 0, 1)
-        fn_label_name = "False Positive (Healthy misclassified as Tumor)"
-    else:
-        fn_label_name = "False Negative (MISSED TUMOR - Clinically Critical)"
+    os.makedirs("saved_features/visuals", exist_ok=True)
+    
+    tp_idx = find_sample_index(y_val_true, y_val_pred, 1, 1)
+    tn_idx = find_sample_index(y_val_true, y_val_pred, 0, 0)
+    fn_idx = find_sample_index(y_val_true, y_val_pred, 1, 0)
 
     test_cases = [
-        {"name": "True Positive (Tumor correctly detected)", "idx": tp_idx},
-        {"name": "True Negative (Healthy correctly detected)", "idx": tn_idx},
-        {"name": fn_label_name, "idx": fn_idx},
+        {"name": "True_Positive", "idx": tp_idx, "label": "Tumor correctly detected"},
+        {"name": "True_Negative", "idx": tn_idx, "label": "Healthy correctly detected"},
+        {"name": "False_Negative", "idx": fn_idx, "label": "Missed Tumor"},
     ]
 
-    # ---------------------------------------------------------
-    # 5 & 6. Generate Explanations and Save to Markdown
-    # ---------------------------------------------------------
-    md_content = "# Brain Tumor Detection: Explainability & Rule Set Catalogue\n\n"
-    md_content += "This document provides human-readable explanations for the ML model's predictions by fusing SHAP local feature attribution with a symbolic IF-THEN reasoning layer.\n\n"
+    md_content = "# Brain Tumor Diagnostic Pipeline: Multi-Modal XAI Report\n\n"
+    md_content += "This report fuses Spatial (LIME), Statistical (SHAP), and Symbolic (Logic) explainability.\n\n"
 
     for case in test_cases:
         idx = case["idx"]
-        if idx is None:
-            continue
+        if idx is None: continue
 
-        x_sample = learner_manager.X_val[idx : idx + 1]
-        true_label = y_val_true[idx]
-        pred_label = y_val_pred[idx]
-        confidence = y_val_proba[idx] if pred_label == 1 else (1 - y_val_proba[idx])
+        print(f"\nProcessing {case['name']}...")
+        x_tabular = learner_manager.X_val[idx:idx+1]
+        # X_raw_val images are [Channels, Height, Width] from pipeline.py. 
+        # LIME needs [Height, Width, Channels] in [0, 255]
+        x_raw_img = X_raw_val[idx]
+        x_raw_img_hwc = (np.transpose(x_raw_img, (1, 2, 0)) * 255).astype(np.uint8)
 
-        print(f"\nEvaluating Case: {case['name']}")
+        # 1. SHAP Logic
+        local_caption = shap_explainer.explain_local(x_tabular, y_val_true[idx])
+        rule_result = assistant.apply_rules(x_tabular)
+        final_explanation = assistant.generate_explanation(y_val_pred[idx], y_val_proba[idx], rule_result)
 
-        # 1. Get Local SHAP explanation (will plot and print to console)
-        local_caption = shap_explainer.explain_local(x_sample, true_label)
+        # 2. LIME Visualization
+        save_path = f"saved_features/visuals/lime_{case['name']}.png"
+        explanation = lime_explainer.explain_instance(x_raw_img_hwc, num_samples=500)
+        lime_explainer.save_explanation(explanation, save_path)
 
-        # 2. Apply Symbolic Rules
-        rule_result = assistant.apply_rules(x_sample)
-
-        # 3. Generate Final Fused Explanation
-        final_explanation = assistant.generate_explanation(
-            pred_label, confidence, rule_result
-        )
-
-        print("\n=> FINAL CLINICAL EXPLANATION:")
-        print(final_explanation)
-        print("-" * 50)
-
-        # Append to Markdown string
-        md_content += f"## Case: {case['name']}\n"
-        md_content += f"**True Label:** {'Tumor' if true_label == 1 else 'Healthy'} | **Model Prediction:** {'Tumor' if pred_label == 1 else 'Healthy'}\n\n"
-        md_content += f"### Symbolic Logic Output\n"
+        # Build Markdown
+        md_content += f"## Case: {case['label']}\n"
+        md_content += f"**Result:** {'Tumor' if y_val_pred[idx] == 1 else 'Healthy'} (Confidence: {y_val_proba[idx]:.1%})\n\n"
+        md_content += f"![LIME Explanation]({save_path})\n\n"
+        md_content += f"### Clinical Reasoning\n> {final_explanation}\n\n"
         md_content += f"* **Triggered Rules:** {', '.join(rule_result.triggered_rules) if rule_result.triggered_rules else 'None'}\n"
-        md_content += f"* **Estimated Risk Level:** {rule_result.risk_level}\n"
-        md_content += f"* **Rule Evaluation:** {rule_result.explanation_text}\n\n"
-        md_content += f"### Clinical Summary\n"
-        md_content += f"> {final_explanation}\n\n"
         md_content += "---\n\n"
 
-    # Write the markdown file
-    md_filepath = "explanation_examples.md"
-    with open(md_filepath, "w") as f:
+    with open("explanation_report.md", "w") as f:
         f.write(md_content)
 
-    print(f"\nSuccess! Full explanation catalogue saved to '{md_filepath}'.")
-    print("Task 4 Deliverables complete.")
+    print("\nSuccess! Multi-modal report saved to 'explanation_report.md'.")
 
 
 if __name__ == "__main__":

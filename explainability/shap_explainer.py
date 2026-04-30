@@ -23,7 +23,7 @@ class SHAPExplainer:
         self.model = model
         self.X_train = X_train
 
-        # Map feature indices back to meaningful names for traceability
+        # Map feature indices back t o meaningful names for traceability
         self.feature_names = [f"CNN_feat_{i}" for i in range(X_train.shape[1])]
 
         # We need a background dataset to integrate over. Using 50 samples keeps
